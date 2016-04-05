@@ -926,6 +926,143 @@ def get_apps(marathon):
     return apps_list
 
 
+def _haproxy_deployment_started(app):
+    """
+    Return the HA proxy started at time from the app label.
+    :param app:
+    :return:
+    """
+    # TODO(brenden): do something more intelligent when the label is
+    # missing.
+    if 'HAPROXY_DEPLOYMENT_STARTED_AT' in app['labels']:
+        return dateutil.parser.parse(
+            app['labels']['HAPROXY_DEPLOYMENT_STARTED_AT'])
+    else:
+        return ''
+
+
+def _task_healthy(app, task):
+    """
+    Determine if a task is healthy or not.  A task is healthy if no health
+    checks are performed by the application, or if there are health check
+    results and they all indicate the task is alive.
+    :param app: The application owning the task.
+    :param task: The task to check.
+    :return: True if healthy, False otherwise.
+    """
+    if not app['healthChecks']:
+        return True
+    results = task.get('healthCheckResults', None)
+    return results and any(result['alive'] for result in results)
+
+
+def _process_apps_by_deployment_group(apps):
+    """
+    Process the list of apps, merging apps in the same deployment group:
+    draining tasks in old apps to maintain the appropriate number of active
+    tasks within each merged app.
+
+    :param apps: The list of unprocessed apps.
+    :return: The list of processed apps.  Apps within the same deployment
+    group will be merged into a common app.
+    """
+    # List of processed apps
+    processed_apps = []
+
+    # List of apps by deployment group
+    deployment_groups = {}
+
+    # Sort through the apps to group together those in the same deployment
+    # group.  Those not in a deployment group can be returned unaltered.
+    for app in apps:
+        deployment_group = app['labels'].get('HAPROXY_DEPLOYMENT_GROUP')
+        if deployment_group:
+            # App is in a deployment group, append the app to the list of apps
+            # apps in the group.
+            if deployment_group[0] != '/':
+                deployment_group = '/' + deployment_group
+            deployment_groups.get(deployment_group, []).append(app)
+        else:
+            # App is not in a deployment group then no need to further process,
+            # add to the processed list.
+            processed_apps.append(app)
+            continue
+
+    # We now have a list of apps for each deployment group.  We need to merge
+    # tasks for apps in the same deployment group.  Sort each list of apps
+    # in order of start time, and merge into the newest app.
+    for deployment_group, apps in deployment_groups.iteritems():
+        # If there is only a single application in the deployment group then
+        # no additional processing is required.
+        if len(apps) == 1:
+            processed_apps.extend(apps)
+            continue
+
+        # There are multiple apps for this deployment group, so merging is
+        # required. Order the apps in ascending order of age (i.e. descending
+        # order of start time). The latest app will form the basis of the
+        # merged one.  Determine the number of healthy tasks and the number
+        # of target instances so that we can work out the number of old tasks
+        # that we want to drain and those that we want to remain active.
+        apps = sorted(apps, reverse=True, key=_haproxy_deployment_started)
+        latest_app = apps[0]
+        healthy_instances = sum(_task_healthy(latest_app, task)
+                                for task in latest_app['tasks'])
+        target_instances = \
+                int(latest_app['labels']['HAPROXY_DEPLOYMENT_TARGET_INSTANCES'])
+
+        # Iterate through the remaining apps appending the tasks from these
+        # apps to the list of tasks in the latest app, and draining those
+        # tasks that are no longer required to maintain the required number
+        # of healthy instances.
+        for app in apps[1:]:
+            target_instances = \
+                int(app['labels']['HAPROXY_DEPLOYMENT_TARGET_INSTANCES'])
+
+            # mark N tasks from old app as draining, where N is the
+            # number of instances in the new app
+            old_tasks = sorted(old['tasks'],
+                               key=lambda task: task['host'] +
+                               ":" + str(task['ports']))
+
+            healthy_new_instances = 0
+            if len(app['healthChecks']) > 0:
+                for task in new['tasks']:
+                    if 'healthCheckResults' not in task:
+                        continue
+                    alive = True
+                    for result in task['healthCheckResults']:
+                        if not result['alive']:
+                            alive = False
+                    if alive:
+                        healthy_new_instances += 1
+            else:
+                healthy_new_instances = new['instances']
+
+            maximum_drainable = \
+                max(0, (healthy_new_instances + old['instances']) -
+                    target_instances)
+
+            for i in range(0, min(len(old_tasks),
+                                  healthy_new_instances,
+                                  maximum_drainable)):
+                old_tasks[i]['draining'] = True
+
+            # merge tasks from new app into old app
+            merged = old
+            old_tasks.extend(new['tasks'])
+            merged['tasks'] = old_tasks
+
+            deployment_groups[deployment_group] = merged
+        else:
+            deployment_groups[deployment_group] = app
+
+        app['id'] = deployment_group
+
+    processed_apps.extend(deployment_groups.values())
+
+    return processed_apps
+
 def regenerate_config(apps, config_file, groups, bind_http_https,
                       ssl_certs, templater):
     compareWriteAndReloadConfig(config(apps, groups, bind_http_https,
